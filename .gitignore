@@ -1,1 +1,3 @@
 /target
+.env
+github_stats.db
