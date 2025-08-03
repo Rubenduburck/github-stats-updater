@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GitHub Stats Updater every 6 hours
+Requires=github-stats-updater.service
+
+[Timer]
+OnCalendar=0/6:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

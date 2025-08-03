@@ -1,0 +1,15 @@
+[Unit]
+Description=GitHub Stats Updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment="GITHUB_TOKEN=YOUR_TOKEN_HERE"
+ExecStart=/home/pi/github-stats-updater/target/release/github-stats-updater
+User=pi
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
