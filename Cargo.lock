@@ -847,6 +847,7 @@ dependencies = [
  "git2",
  "octocrab",
  "serde",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokei",

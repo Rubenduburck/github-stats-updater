@@ -24,11 +24,11 @@ struct Args {
     #[arg(long)]
     write_token: Option<String>,
 
-    #[arg(short, long, default_value = "rubenduburck")]
-    username: String,
+    #[arg(short, long)]
+    username: Option<String>,
 
-    #[arg(short, long, default_value = "rubenduburck")]
-    repo_name: String,
+    #[arg(short, long)]
+    repo_name: Option<String>,
 
     #[arg(long, default_value = "README.md")]
     readme_path: String,
@@ -49,9 +49,45 @@ struct Args {
     #[arg(long)]
     user_emails: Option<String>,
     
-    /// Only process specific repository (e.g. "vertigo-backend")
+    /// Only process specific repository (e.g. "my-repo")
     #[arg(long)]
     only_repo: Option<String>,
+    
+    /// Manage blacklist: add commit hashes to exclude (comma-separated)
+    #[arg(long)]
+    blacklist_add: Option<String>,
+    
+    /// Manage blacklist: remove commit hashes from blacklist (comma-separated)
+    #[arg(long)]
+    blacklist_remove: Option<String>,
+    
+    /// Show current blacklist
+    #[arg(long)]
+    blacklist_show: bool,
+    
+    /// Path to JSON file containing blacklisted commits
+    #[arg(long, default_value = "blacklist.json")]
+    blacklist_file: String,
+    
+    /// Only recreate output from existing database data without fetching from GitHub
+    #[arg(long)]
+    recreate_only: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BlacklistEntry {
+    commit_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    date_added: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BlacklistConfig {
+    blacklist: Vec<BlacklistEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]
@@ -91,7 +127,11 @@ struct DailyLanguageActivity {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv::dotenv().ok();
+    // Load .env file if it exists
+    match dotenv::dotenv() {
+        Ok(path) => tracing::debug!("Loaded environment from: {:?}", path),
+        Err(e) => tracing::debug!("No .env file loaded: {}", e),
+    }
     let mut args = Args::parse();
     
     // Also check environment for user emails if not provided via CLI
@@ -118,120 +158,170 @@ async fn main() -> Result<()> {
     tracing::info!("Starting GitHub Stats Updater");
     tracing::debug!(?args, "Parsed command line arguments");
 
-    let read_token = args.read_token.clone().or_else(|| {
-        tracing::debug!("Read token not provided via CLI, checking environment");
-        std::env::var("PAT_READ").ok()
-    }).expect("PAT_READ must be set in environment or provided as --read-token");
+    // Read token is only required if not recreate_only mode
+    let read_token = if !args.recreate_only {
+        args.read_token.clone().or_else(|| {
+            tracing::debug!("Read token not provided via CLI, checking environment");
+            std::env::var("PAT_READ").ok()
+        }).ok_or_else(|| {
+            anyhow::anyhow!("PAT_READ must be set in environment (.env file or environment variable) or provided as --read-token")
+        })?
+    } else {
+        String::new()  // Empty token when only recreating output
+    };
 
-    let write_token = args.write_token.clone().or_else(|| {
-        tracing::debug!("Write token not provided via CLI, checking environment");
-        std::env::var("PAT_WRITE").ok()
-    }).expect("PAT_WRITE must be set in environment or provided as --write-token");
+    // Write token is only required if repo_name is provided and we're actually updating
+    let write_token = if args.repo_name.is_some() {
+        args.write_token.clone().or_else(|| {
+            tracing::debug!("Write token not provided via CLI, checking environment");
+            std::env::var("PAT_WRITE").ok()
+        }).ok_or_else(|| {
+            anyhow::anyhow!("PAT_WRITE must be set in environment (.env file or environment variable) or provided as --write-token when --repo-name is specified")
+        })?
+    } else {
+        String::new()  // Empty token when not pushing to README
+    };
 
-    tracing::info!("Initializing GitHub API client");
-    let octocrab = Octocrab::builder()
-        .personal_token(read_token.clone())
-        .build()?;
+    // Only initialize GitHub API client if not in recreate_only mode
+    let octocrab = if !args.recreate_only {
+        tracing::info!("Initializing GitHub API client");
+        Some(Octocrab::builder()
+            .personal_token(read_token.clone())
+            .build()?)
+    } else {
+        None
+    };
 
     // Initialize database connection pool
     tracing::info!(db_url = %args.db_url, "Initializing database connection");
     let pool = initialize_database(&args.db_url).await?;
-
-    tracing::info!(username = %args.username, "Fetching repositories");
-
-    let mut page: u8 = 1;
-    let mut all_repos = Vec::new();
-
-    loop {
-        let repos = octocrab
-            .current()
-            .list_repos_for_authenticated_user()
-            .per_page(100)
-            .page(page)
-            .send()
-            .await?;
-
-        if repos.items.is_empty() {
-            break;
-        }
-
-        all_repos.extend(repos.items);
-        page += 1;
+    
+    // Sync blacklist from JSON file if it exists
+    sync_blacklist_from_file(&pool, &args.blacklist_file).await?;
+    
+    // Handle blacklist management commands
+    if args.blacklist_show || args.blacklist_add.is_some() || args.blacklist_remove.is_some() {
+        return manage_blacklist(&pool, &args).await;
     }
+    
+    // Username is required for normal operation
+    let username = args.username.clone()
+        .ok_or_else(|| anyhow::anyhow!("--username is required for processing commits"))?;
+    let repo_name = args.repo_name.clone();  // Optional - if not provided, won't push to README
 
-    tracing::info!(count = all_repos.len(), "Found repositories");
+    // Skip repository fetching if recreate_only is set
+    if !args.recreate_only {
+        tracing::info!(username = %username, "Fetching repositories");
 
-    let temp_dir = TempDir::new()?;
+        let mut page: u8 = 1;
+        let mut all_repos = Vec::new();
 
-    for repo in all_repos {
-        // Process both owned repos and forks
-        if let Some(clone_url) = repo.clone_url {
-            let repo_full_name = format!("{}/{}", repo.owner.as_ref().unwrap().login, repo.name);
-            
-            // Skip if filtering for specific repo
-            if let Some(ref only) = args.only_repo {
-                if !repo.name.eq_ignore_ascii_case(only) && !repo_full_name.ends_with(&format!("/{}", only)) {
-                    continue;
-                }
+        loop {
+            let repos = octocrab
+                .as_ref()
+                .unwrap()
+                .current()
+                .list_repos_for_authenticated_user()
+                .per_page(100)
+                .page(page)
+                .send()
+                .await?;
+
+            if repos.items.is_empty() {
+                break;
             }
 
-            // Get the last processed commit for incremental updates
-            // But we still enter the repo to check for new commits
-            let last_processed = if args.force_rescan {
-                None
-            } else {
-                get_last_processed_commit(&pool, &repo_full_name).await?
-            };
+            all_repos.extend(repos.items);
+            page += 1;
+        }
 
-            tracing::info!(repo = %repo_full_name, "Processing repository");
+        tracing::info!(count = all_repos.len(), "Found repositories");
 
-            let repo_path = temp_dir.path().join(&repo.name);
+        let temp_dir = TempDir::new()?;
 
-            // Clone the repository
-            let local_repo =
-                match clone_repository(clone_url.as_str(), &repo_path, &read_token) {
-                    Ok(repo) => repo,
-                    Err(e) => {
-                        tracing::error!(repo = %repo_full_name, error = %e, "Failed to clone repository");
+        for repo in all_repos {
+            // Process both owned repos and forks
+            if let Some(clone_url) = repo.clone_url {
+                let repo_full_name = format!("{}/{}", repo.owner.as_ref().unwrap().login, repo.name);
+                
+                // Skip if filtering for specific repo
+                if let Some(ref only) = args.only_repo {
+                    if !repo.name.eq_ignore_ascii_case(only) && !repo_full_name.ends_with(&format!("/{}", only)) {
                         continue;
                     }
+                }
+
+                // Get the last processed commit for incremental updates
+                // But we still enter the repo to check for new commits
+                let last_processed = if args.force_rescan {
+                    None
+                } else {
+                    get_last_processed_commit(&pool, &repo_full_name).await?
                 };
 
-            // Process commits by the user
-            match process_user_commits(
-                &pool,
-                &local_repo,
-                &repo_full_name,
-                &args.username,
-                args.user_emails.as_deref(),
-                last_processed.as_deref(),
-            )
-            .await
-            {
-                Ok(_) => {},
-                Err(e) => {
-                    // Check if this is just an empty repo
-                    if e.to_string().contains("reference") && e.to_string().contains("not found") {
-                        tracing::info!(repo = %repo_full_name, "Repository appears to be empty (no commits on default branch)");
-                    } else {
-                        tracing::error!(repo = %repo_full_name, error = %e, "Failed to process commits");
+                tracing::info!(repo = %repo_full_name, "Processing repository");
+
+                let repo_path = temp_dir.path().join(&repo.name);
+
+                // Clone the repository
+                let local_repo =
+                    match clone_repository(clone_url.as_str(), &repo_path, &read_token) {
+                        Ok(repo) => repo,
+                        Err(e) => {
+                            tracing::error!(repo = %repo_full_name, error = %e, "Failed to clone repository");
+                            continue;
+                        }
+                    };
+
+                // Process commits by the user
+                match process_user_commits(
+                    &pool,
+                    &local_repo,
+                    &repo_full_name,
+                    &username,
+                    args.user_emails.as_deref(),
+                    last_processed.as_deref(),
+                )
+                .await
+                {
+                    Ok(_) => {},
+                    Err(e) => {
+                        // Check if this is just an empty repo
+                        if e.to_string().contains("reference") && e.to_string().contains("not found") {
+                            tracing::info!(repo = %repo_full_name, "Repository appears to be empty (no commits on default branch)");
+                        } else {
+                            tracing::error!(repo = %repo_full_name, error = %e, "Failed to process commits");
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
         }
+    } else {
+        tracing::info!("Skipping repository fetching, using existing database data");
     }
 
     // Generate statistics from database
-    let stats = generate_language_stats(&pool, &args.username).await?;
+    let stats = generate_language_stats(&pool, &username).await?;
     
     // Generate daily activity for graph
-    let daily_activity = generate_daily_language_activity(&pool, &args.username).await?;
+    let daily_activity = generate_daily_language_activity(&pool, &username).await?;
 
-    // Update README with stats and graph
-    update_readme(&args, &stats, &daily_activity, &write_token)?;
+    // Generate formatted output
+    let output = generate_stats_output(&stats, &daily_activity)?;
+    
+    // Update README with stats and graph (only if repo_name is provided)
+    if let Some(repo_name) = repo_name {
+        update_readme(&username, &repo_name, &args.readme_path, &stats, &daily_activity, &write_token)?;
+        tracing::info!("README updated successfully!");
+    } else {
+        tracing::info!("No repo-name provided, displaying statistics to console");
+        // Output full stats to console
+        println!("\n{}", output);
+        println!("\n📁 Stats saved to database: {}", args.db_url);
+        println!("💡 To push these stats to a GitHub README, provide --repo-name");
+    }
 
-    tracing::info!("README updated successfully!");
     tracing::info!("GitHub Stats Updater completed successfully");
 
     Ok(())
@@ -278,7 +368,8 @@ async fn initialize_database(db_url: &str) -> Result<SqlitePool> {
             language TEXT NOT NULL,
             lines_added INTEGER NOT NULL,
             lines_removed INTEGER NOT NULL,
-            FOREIGN KEY (commit_hash) REFERENCES commits(commit_hash)
+            FOREIGN KEY (commit_hash) REFERENCES commits(commit_hash),
+            UNIQUE(commit_hash, language)
         )",
     )
     .execute(&pool)
@@ -300,6 +391,17 @@ async fn initialize_database(db_url: &str) -> Result<SqlitePool> {
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_commit_languages_hash ON commit_languages(commit_hash)",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Create blacklist table for excluded commits
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS commit_blacklist (
+            commit_hash TEXT PRIMARY KEY,
+            reason TEXT,
+            added_date INTEGER NOT NULL
+        )",
     )
     .execute(&pool)
     .await?;
@@ -411,6 +513,9 @@ async fn process_user_commits(
                 break;  // Stop here, we've seen everything after this
             }
         }
+        
+        // Note: We don't skip blacklisted commits during processing
+        // They are filtered out during stats generation only
 
         // Track the first commit we process (will be the latest)
         if last_commit_hash.is_empty() {
@@ -680,8 +785,9 @@ async fn store_commit_with_languages<'a>(
     for lang_stat in language_stats {
         let language_name = format!("{:?}", lang_stat.language);
         
+        // Use INSERT OR REPLACE to update existing entries
         sqlx::query(
-            "INSERT OR IGNORE INTO commit_languages (commit_hash, language, lines_added, lines_removed)
+            "INSERT OR REPLACE INTO commit_languages (commit_hash, language, lines_added, lines_removed)
              VALUES (?1, ?2, ?3, ?4)"
         )
         .bind(commit_hash)
@@ -777,15 +883,16 @@ async fn generate_language_stats(pool: &SqlitePool, username: &str) -> Result<Ve
         }]);
     }
 
-    // First get total stats from commits table
+    // First get total stats from commits table (excluding blacklisted)
     let query_str = format!(
         "SELECT 
-            COUNT(DISTINCT commit_hash) as commits,
-            COALESCE(SUM(lines_added), 0) as total_added,
-            COALESCE(SUM(lines_removed), 0) as total_removed,
-            COALESCE(SUM(lines_added - lines_removed), 0) as net_lines
-         FROM commits
-         WHERE {}",
+            COUNT(DISTINCT c.commit_hash) as commits,
+            COALESCE(SUM(c.lines_added), 0) as total_added,
+            COALESCE(SUM(c.lines_removed), 0) as total_removed,
+            COALESCE(SUM(c.lines_added - c.lines_removed), 0) as net_lines
+         FROM commits c
+         WHERE ({}) 
+         AND c.commit_hash NOT IN (SELECT commit_hash FROM commit_blacklist)",
         email_conditions
     );
     
@@ -804,7 +911,7 @@ async fn generate_language_stats(pool: &SqlitePool, username: &str) -> Result<Ve
         commits: total_row.get::<i64, _>("commits"),
     }];
 
-    // Now get language-specific stats
+    // Now get language-specific stats (excluding blacklisted)
     let lang_query_str = format!(
         "SELECT 
             cl.language,
@@ -814,7 +921,8 @@ async fn generate_language_stats(pool: &SqlitePool, username: &str) -> Result<Ve
             COALESCE(SUM(cl.lines_added - cl.lines_removed), 0) as net_lines
          FROM commit_languages cl
          INNER JOIN commits c ON cl.commit_hash = c.commit_hash
-         WHERE {}
+         WHERE ({}) 
+         AND c.commit_hash NOT IN (SELECT commit_hash FROM commit_blacklist)
          GROUP BY cl.language
          ORDER BY SUM(cl.lines_added - cl.lines_removed) DESC",
         email_conditions
@@ -896,7 +1004,8 @@ async fn generate_daily_language_activity(pool: &SqlitePool, username: &str) -> 
             SUM(cl.lines_removed) as lines_removed
          FROM commit_languages cl
          INNER JOIN commits c ON cl.commit_hash = c.commit_hash
-         WHERE {}
+         WHERE ({}) 
+         AND c.commit_hash NOT IN (SELECT commit_hash FROM commit_blacklist)
          GROUP BY DATE(c.commit_date, 'unixepoch'), cl.language
          ORDER BY day, cl.language",
         email_conditions
@@ -950,6 +1059,98 @@ fn generate_unicode_bar(value: f64, max_value: f64, width: usize) -> String {
         bar.push(' ');
     }
     bar
+}
+
+fn generate_stats_output(stats: &[LanguageStats], daily_activity: &[DailyLanguageActivity]) -> Result<String> {
+    let total_stat = stats
+        .iter()
+        .find(|s| s.language == "Total")
+        .ok_or_else(|| anyhow::anyhow!("No stats found"))?;
+
+    let mut content = String::from("📊 GitHub Contribution Statistics\n");
+    content.push_str(&"=".repeat(50));
+    content.push_str("\n*Based on actual commits across all repositories (including forks)*\n\n");
+
+    let net_total_str = if total_stat.net_lines >= 0 {
+        format_number(total_stat.net_lines as usize)
+    } else {
+        format!("-{}", format_number((-total_stat.net_lines) as usize))
+    };
+    
+    content.push_str(&format!(
+        "📈 Overall Statistics\n{}\n\
+        • Total Commits:   {:>12}\n\
+        • Lines Added:     {:>12}\n\
+        • Lines Removed:   {:>12}\n\
+        • Net Lines:       {:>12}\n\n",
+        "-".repeat(22),
+        format_number(total_stat.commits as usize),
+        format_number(total_stat.lines_added as usize),
+        format_number(total_stat.lines_removed as usize),
+        net_total_str
+    ));
+
+    // Add language breakdown if we have language-specific stats
+    let language_stats: Vec<&LanguageStats> = stats
+        .iter()
+        .filter(|s| s.language != "Total")
+        .collect();
+    
+    if !language_stats.is_empty() {
+        content.push_str("💻 Language Breakdown\n");
+        content.push_str(&"-".repeat(22));
+        content.push_str("\n");
+        content.push_str(&format!("{:<15} {:>10} {:>12} {:>12} {:>8}\n", 
+            "Language", "Net Lines", "Added", "Removed", "Commits"));
+        content.push_str(&format!("{:<15} {:>10} {:>12} {:>12} {:>8}\n", 
+            "-".repeat(15), "-".repeat(10), "-".repeat(12), "-".repeat(12), "-".repeat(8)));
+        
+        for lang_stat in language_stats.iter().take(15) {  // Show top 15 languages
+            let net_str = if lang_stat.net_lines >= 0 {
+                format_number(lang_stat.net_lines as usize)
+            } else {
+                format!("-{}", format_number((-lang_stat.net_lines) as usize))
+            };
+            
+            content.push_str(&format!(
+                "{:<15} {:>10} {:>12} {:>12} {:>8}\n",
+                lang_stat.language,
+                net_str,
+                format_number(lang_stat.lines_added as usize),
+                format_number(lang_stat.lines_removed as usize),
+                format_number(lang_stat.commits as usize)
+            ));
+        }
+        content.push_str("\n");
+    }
+    
+    // Add activity visualizations
+    if !daily_activity.is_empty() {
+        content.push_str("📊 Code Activity Visualizations\n");
+        content.push_str(&"=".repeat(50));
+        content.push_str("\n\n");
+        
+        // Generate charts
+        if let Ok(charts) = generate_activity_charts(daily_activity) {
+            content.push_str(&charts);
+        }
+        
+        // Add date range info
+        let min_date = daily_activity.iter().map(|a| a.date).min().unwrap();
+        let max_date = daily_activity.iter().map(|a| a.date).max().unwrap();
+        content.push_str(&format!(
+            "*Data from {} to {}*\n",
+            min_date.format("%Y-%m-%d"),
+            max_date.format("%Y-%m-%d")
+        ));
+    }
+
+    content.push_str(&format!(
+        "\n*Generated: {}*",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
+    ));
+
+    Ok(content)
 }
 
 fn generate_activity_charts(daily_activity: &[DailyLanguageActivity]) -> Result<String> {
@@ -1088,8 +1289,8 @@ fn generate_activity_charts(daily_activity: &[DailyLanguageActivity]) -> Result<
     Ok(output)
 }
 
-#[tracing::instrument(skip(args, write_token))]
-fn update_readme(args: &Args, stats: &[LanguageStats], daily_activity: &[DailyLanguageActivity], write_token: &str) -> Result<()> {
+#[tracing::instrument(skip(write_token))]
+fn update_readme(username: &str, repo_name: &str, readme_path: &str, stats: &[LanguageStats], daily_activity: &[DailyLanguageActivity], write_token: &str) -> Result<()> {
     tracing::info!("Updating README with latest statistics");
     let total_stat = stats
         .iter()
@@ -1172,13 +1373,13 @@ fn update_readme(args: &Args, stats: &[LanguageStats], daily_activity: &[DailyLa
     ));
 
     // Clone or use existing README repository
-    let repo_path = PathBuf::from(&args.repo_name);
+    let repo_path = PathBuf::from(repo_name);
     if !repo_path.exists() {
         tracing::info!("README repository not found locally, cloning");
         Repository::clone(
             &format!(
                 "https://{}@github.com/{}/{}.git",
-                write_token, args.username, args.repo_name
+                write_token, username, repo_name
             ),
             &repo_path,
         )?;
@@ -1186,13 +1387,13 @@ fn update_readme(args: &Args, stats: &[LanguageStats], daily_activity: &[DailyLa
         tracing::debug!("Using existing README repository");
     }
 
-    let readme_full_path = repo_path.join(&args.readme_path);
+    let readme_full_path = repo_path.join(readme_path);
     fs::write(&readme_full_path, content)?;
 
     // Commit and push changes
     let repo = Repository::open(&repo_path)?;
     let mut index = repo.index()?;
-    index.add_path(Path::new(&args.readme_path))?;
+    index.add_path(Path::new(readme_path))?;
     index.write()?;
 
     let tree_id = index.write_tree()?;
@@ -1240,3 +1441,190 @@ fn format_number(n: usize) -> String {
     }
     result
 }
+
+#[tracing::instrument(skip(pool))]
+async fn sync_blacklist_from_file(pool: &SqlitePool, blacklist_file: &str) -> Result<()> {
+    let path = Path::new(blacklist_file);
+    
+    if !path.exists() {
+        tracing::debug!("Blacklist file {} does not exist, skipping sync", blacklist_file);
+        return Ok(());
+    }
+    
+    tracing::info!("Syncing blacklist from file: {}", blacklist_file);
+    
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read blacklist file: {}", blacklist_file))?;
+    
+    let config: BlacklistConfig = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse blacklist JSON from: {}", blacklist_file))?;
+    
+    // Get existing blacklist from database
+    let existing_rows = sqlx::query("SELECT commit_hash FROM commit_blacklist")
+        .fetch_all(pool)
+        .await?;
+    
+    let mut existing_hashes = std::collections::HashSet::new();
+    for row in existing_rows {
+        let hash: String = row.get("commit_hash");
+        existing_hashes.insert(hash);
+    }
+    
+    // Track what's in the JSON file
+    let mut json_hashes = std::collections::HashSet::new();
+    
+    // Add new entries from JSON to database
+    let now = chrono::Utc::now().timestamp();
+    for entry in &config.blacklist {
+        json_hashes.insert(entry.commit_hash.clone());
+        
+        if !existing_hashes.contains(&entry.commit_hash) {
+            let reason = entry.reason.as_deref().unwrap_or("From blacklist.json");
+            
+            sqlx::query(
+                "INSERT INTO commit_blacklist (commit_hash, reason, added_date) VALUES (?1, ?2, ?3)"
+            )
+            .bind(&entry.commit_hash)
+            .bind(reason)
+            .bind(now)
+            .execute(pool)
+            .await?;
+            
+            tracing::info!("Added {} to blacklist from JSON file", &entry.commit_hash);
+        }
+    }
+    
+    // Remove entries from database that are not in JSON file
+    for existing_hash in &existing_hashes {
+        if !json_hashes.contains(existing_hash) {
+            sqlx::query("DELETE FROM commit_blacklist WHERE commit_hash = ?1")
+                .bind(existing_hash)
+                .execute(pool)
+                .await?;
+            
+            tracing::info!("Removed {} from blacklist (not in JSON file)", existing_hash);
+        }
+    }
+    
+    tracing::info!(
+        "Blacklist sync complete: {} entries in sync",
+        json_hashes.len()
+    );
+    
+    Ok(())
+}
+
+#[tracing::instrument(skip(pool))]
+async fn manage_blacklist(pool: &SqlitePool, args: &Args) -> Result<()> {
+    // Helper function to save current blacklist to JSON file
+    async fn save_blacklist_to_file(pool: &SqlitePool, blacklist_file: &str) -> Result<()> {
+        let rows = sqlx::query(
+            "SELECT commit_hash, reason FROM commit_blacklist ORDER BY added_date DESC"
+        )
+        .fetch_all(pool)
+        .await?;
+        
+        let mut entries = Vec::new();
+        for row in rows {
+            let hash: String = row.get("commit_hash");
+            let reason: Option<String> = row.get("reason");
+            
+            entries.push(BlacklistEntry {
+                commit_hash: hash,
+                reason,
+                repository: None,
+                date_added: Some(chrono::Utc::now().format("%Y-%m-%d").to_string()),
+            });
+        }
+        
+        let config = BlacklistConfig { blacklist: entries };
+        let json = serde_json::to_string_pretty(&config)?;
+        fs::write(blacklist_file, json)?;
+        
+        tracing::info!("Saved blacklist to {}", blacklist_file);
+        Ok(())
+    }
+    
+    // Show blacklist
+    if args.blacklist_show {
+        let rows = sqlx::query(
+            "SELECT commit_hash, reason, datetime(added_date, 'unixepoch') as added_at 
+             FROM commit_blacklist 
+             ORDER BY added_date DESC"
+        )
+        .fetch_all(pool)
+        .await?;
+        
+        if rows.is_empty() {
+            println!("No commits in blacklist.");
+        } else {
+            println!("\nBlacklisted commits:");
+            println!("{:<45} {:<30} {:<20}", "Commit Hash", "Reason", "Added At");
+            println!("{}", "-".repeat(95));
+            for row in rows {
+                let hash: String = row.get("commit_hash");
+                let reason: Option<String> = row.get("reason");
+                let added_at: String = row.get("added_at");
+                println!("{:<45} {:<30} {:<20}", 
+                    hash, 
+                    reason.unwrap_or_else(|| "No reason provided".to_string()),
+                    added_at
+                );
+            }
+        }
+    }
+    
+    // Add to blacklist
+    if let Some(hashes) = &args.blacklist_add {
+        let hashes: Vec<&str> = hashes.split(',').map(|s| s.trim()).collect();
+        for hash in hashes {
+            if hash.len() < 7 {
+                eprintln!("Warning: Skipping invalid hash '{}' (too short)", hash);
+                continue;
+            }
+            
+            let now = chrono::Utc::now().timestamp();
+            let result = sqlx::query(
+                "INSERT OR IGNORE INTO commit_blacklist (commit_hash, reason, added_date) 
+                 VALUES (?1, ?2, ?3)"
+            )
+            .bind(hash)
+            .bind("Manually blacklisted")
+            .bind(now)
+            .execute(pool)
+            .await?;
+            
+            if result.rows_affected() > 0 {
+                println!("Added {} to blacklist", hash);
+            } else {
+                println!("{} was already in blacklist", hash);
+            }
+        }
+        
+        // Save updated blacklist to JSON file
+        save_blacklist_to_file(pool, &args.blacklist_file).await?;
+    }
+    
+    // Remove from blacklist
+    if let Some(hashes) = &args.blacklist_remove {
+        let hashes: Vec<&str> = hashes.split(',').map(|s| s.trim()).collect();
+        for hash in hashes {
+            let result = sqlx::query("DELETE FROM commit_blacklist WHERE commit_hash = ?1")
+                .bind(hash)
+                .execute(pool)
+                .await?;
+                
+            if result.rows_affected() > 0 {
+                println!("Removed {} from blacklist", hash);
+            } else {
+                println!("{} was not in blacklist", hash);
+            }
+        }
+        
+        // Save updated blacklist to JSON file
+        save_blacklist_to_file(pool, &args.blacklist_file).await?;
+    }
+    
+    Ok(())
+}
+
